@@ -5,7 +5,9 @@ import {
   DocumentSuggestion,
   SuggestionJobFailedDocument,
   TagOption,
+  UpdateDocumentsResponse,
 } from "../DocumentProcessor";
+import { newCommitId } from "../commitId";
 import SuggestionCard from "./SuggestionCard";
 import Button from "./ui/Button";
 import ConfirmDialog from "./ui/ConfirmDialog";
@@ -51,8 +53,19 @@ const SuggestionsReview: React.FC<SuggestionsReviewProps> = ({
   const [showSummary, setShowSummary] = useState(false);
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Informational commit notices ("history backfilling" / "recovered"). These
+  // are successes, never shown in the red error banner.
+  const [notice, setNotice] = useState<string | null>(null);
   const statsRef = useRef({ docs: 0, fields: 0 });
   const finishedRef = useRef(false);
+  // Stable submission identity per document: reused while the exact payload
+  // is re-submitted unconfirmed (so a retried request can't write
+  // paperless-ngx twice); a different field selection (e.g. toggled
+  // exclusions after an ambiguous failure) is a new submission and gets a
+  // fresh id, so an idempotent retry can never silently apply the old set.
+  const commitRefs = useRef(
+    new Map<number, { signature: string; id: string }>()
+  );
 
   // A retry job can append documents after mount.
   useEffect(() => {
@@ -155,6 +168,7 @@ const SuggestionsReview: React.FC<SuggestionsReviewProps> = ({
   // every success in that batch, and the next click sent those documents again.
   const applyDocuments = async (docsToApply: DocumentSuggestion[]) => {
     setError(null);
+    setNotice(null);
     const ids = docsToApply.map((doc) => doc.id);
     // Track applying ids incrementally so concurrent single-doc applies don't
     // clear each other's loading state.
@@ -164,17 +178,27 @@ const SuggestionsReview: React.FC<SuggestionsReviewProps> = ({
       return next;
     });
     let applied = 0;
+    const notices: string[] = [];
     try {
       for (const item of docsToApply) {
         const excluded = excludedMap[item.id] || new Set();
-        const payload = buildUpdatePayload(item, excluded);
-        const res = await axios.patch<{
-          partial?: {
-            document_id: number;
-            dropped_fields: string[];
-            fail_tag?: string;
-          };
-        }>("./api/update-documents", [payload]);
+        const built = buildUpdatePayload(item, excluded);
+        // Signature of exactly what this submit sends. Reusing the commit id
+        // across retries is only safe while this is unchanged.
+        const signature = JSON.stringify(built);
+        let ref = commitRefs.current.get(item.id);
+        if (!ref || ref.signature !== signature) {
+          ref = { signature, id: newCommitId() };
+          commitRefs.current.set(item.id, ref);
+        }
+        const payload: DocumentSuggestion = {
+          ...built,
+          commit_id: ref.id,
+        };
+        const res = await axios.patch<UpdateDocumentsResponse>(
+          "./api/update-documents",
+          [payload]
+        );
         const partial = res.data?.partial;
         if (partial) {
           setError(
@@ -184,13 +208,39 @@ const SuggestionsReview: React.FC<SuggestionsReviewProps> = ({
                 : ".")
           );
         }
+        const outcome = res.data?.commits?.find(
+          (commit) => commit.document_id === item.id
+        );
+        const docName = item.original_document.title || `document ${item.id}`;
+        if (outcome?.already_committed) {
+          notices.push(
+            `“${docName}” was already applied to paperless-ngx; the local modification history has been recovered.`
+          );
+        } else if (outcome?.history_status === "pending") {
+          notices.push(
+            `“${docName}” was applied to paperless-ngx, but its local modification history is still being backfilled — it will appear in History shortly.`
+          );
+        }
+        // 200 means paperless-ngx accepted the update regardless of the local
+        // history state: converge the document out of pending right away.
         markApplied(item.id, countChanges(item, excluded));
+        commitRefs.current.delete(item.id);
         applied += 1;
       }
       setShowSummary(false);
+      if (notices.length > 0) setNotice(notices.join(" "));
     } catch (err) {
       console.error("Error updating documents:", err);
       setShowSummary(false);
+      const failedDoc = docsToApply[applied];
+      if (failedDoc && axios.isAxiosError(err) && err.response) {
+        // Definitive rejection: the id stays bound to this payload signature;
+        // a resubmission with edited fields gets a fresh id automatically
+        // (signature mismatch), while an unchanged retry simply proceeds as a
+        // normal submit since no commit row exists. A network/timeout error
+        // keeps the id so a retry cannot write paperless-ngx twice.
+        commitRefs.current.delete(failedDoc.id);
+      }
       const remaining = docsToApply.length - applied;
       setError(
         applied === 0
@@ -264,6 +314,18 @@ const SuggestionsReview: React.FC<SuggestionsReviewProps> = ({
           </span>
           <Button size="sm" variant="secondary" onClick={onRetryFailed}>
             Retry failed
+          </Button>
+        </div>
+      )}
+
+      {notice && (
+        <div
+          role="status"
+          className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-line bg-surface-2 px-4 py-3 text-sm text-muted"
+        >
+          <span>{notice}</span>
+          <Button size="sm" variant="secondary" onClick={() => setNotice(null)}>
+            Dismiss
           </Button>
         </div>
       )}

@@ -188,6 +188,12 @@ type DocumentSuggestion struct {
 	AddTags                []string                `json:"add_tags,omitempty"`
 	CustomFieldsWriteMode  string                  `json:"custom_fields_write_mode,omitempty"`
 	CustomFieldsEnable     bool                    `json:"custom_fields_enable"`
+	// CommitID is the client-generated identity of one submission. Retries of
+	// the same unconfirmed submission reuse it so the server never PATCHes
+	// paperless-ngx twice; a fresh user action (or a definitive rejection)
+	// uses a new one. Empty means "generate one server-side" (background
+	// processing and undo).
+	CommitID string `json:"commit_id,omitempty"`
 }
 
 type Correspondent struct {
@@ -251,11 +257,44 @@ func (e *PartialUpdateError) Error() string {
 	return fmt.Sprintf("document %d updated with %d field(s) dropped due to paperless-ngx validation errors: %v", e.DocumentID, len(e.DroppedFields), e.DroppedFields)
 }
 
+// DocumentCommitOutcome reports the committed result of one document update:
+// once paperless-ngx accepted the PATCH this is a success, even when the
+// local modification history is still being backfilled.
+type DocumentCommitOutcome struct {
+	DocumentID       int    `json:"document_id"`
+	CommitID         string `json:"commit_id"`
+	AlreadyCommitted bool   `json:"already_committed"`
+	// HistoryStatus is "complete" when every landed field has a local
+	// ModificationHistory row, "pending" while the reconciler is backfilling.
+	HistoryStatus string `json:"history_status"`
+}
+
+// UpdateDocumentsResult carries one outcome per document. It is returned
+// alongside a possible *PartialUpdateError (kept as an error for existing
+// callers) and is always populated for documents whose remote PATCH was
+// confirmed.
+type UpdateDocumentsResult struct {
+	Documents []DocumentCommitOutcome
+}
+
+// OutcomeFor returns the outcome recorded for documentID, or nil.
+func (r *UpdateDocumentsResult) OutcomeFor(documentID int) *DocumentCommitOutcome {
+	if r == nil {
+		return nil
+	}
+	for i := range r.Documents {
+		if r.Documents[i].DocumentID == documentID {
+			return &r.Documents[i]
+		}
+	}
+	return nil
+}
+
 // ClientInterface defines the interface for PaperlessClient operations
 type ClientInterface interface {
 	GetDocumentsByTag(ctx context.Context, tag string, pageSize int) ([]Document, error)
 	GetDocumentCountByTag(ctx context.Context, tag string) (int, error)
-	UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error
+	UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) (*UpdateDocumentsResult, error)
 	GetDocument(ctx context.Context, documentID int) (Document, error)
 	GetDocumentThumbnail(ctx context.Context, documentID int) ([]byte, string, error)
 	SearchDocuments(ctx context.Context, query string, pageSize int) ([]Document, error)

@@ -62,6 +62,7 @@ type mockClient struct {
 	tags             map[string]int
 	taggedDocuments  map[string][]Document
 	updateDocsCalled bool
+	updateDocsCalls  int
 }
 
 func newMockClient(baseClient *PaperlessClient) *mockClient {
@@ -77,9 +78,10 @@ func (m *mockClient) GetDocumentsByTag(ctx context.Context, tag string, pageSize
 	return m.taggedDocuments[tag], nil
 }
 
-func (m *mockClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
+func (m *mockClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) (*UpdateDocumentsResult, error) {
 	m.updateDocsCalled = true
-	return nil
+	m.updateDocsCalls++
+	return &UpdateDocumentsResult{}, nil
 }
 
 func (m *mockClient) GetDocument(ctx context.Context, documentID int) (Document, error) {
@@ -375,7 +377,7 @@ func (app *TestApp) processAutoOcrTagDocuments(ctx context.Context) (int, error)
 
 				// Remove only the autoOcrTag to take it out of the processing queue
 				// while preserving the OCR complete tag
-				err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{
+				_, err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{
 					{
 						ID:               document.ID,
 						OriginalDocument: document,
@@ -418,7 +420,7 @@ func (app *TestApp) processAutoOcrTagDocuments(ctx context.Context) (int, error)
 			docLogger.Infof("Adding OCR complete tag '%s'", app.pdfOCRCompleteTag)
 		}
 
-		err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{
+		_, err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{
 			documentSuggestion,
 		}, app.Database, false)
 		if err != nil {
@@ -548,8 +550,11 @@ func TestProcessAutoOcrTagDocuments(t *testing.T) {
 				assert.Equal(t, tc.expectedCount, count)
 			}
 
-			// Verify client was called to update documents
+			// Verify client was called to update documents exactly once:
+			// after a confirmed update the loop must not perform failure
+			// recovery (no trigger-tag/fail-tag second PATCH).
 			assert.True(t, client.updateDocsCalled, "UpdateDocuments should have been called")
+			assert.Equal(t, 1, client.updateDocsCalls, "a successful commit must not trigger any recovery PATCH")
 		})
 	}
 }
@@ -566,15 +571,15 @@ type recordingClient struct {
 	getAllTagsErr   error                 // when set, GetAllTags fails — used to make suggestion generation fail
 }
 
-func (r *recordingClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
+func (r *recordingClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) (*UpdateDocumentsResult, error) {
 	for _, d := range documents {
 		r.calls = append(r.calls, d)
 	}
 	if r.failAfterNCalls > 0 {
 		r.failAfterNCalls--
-		return r.updateErr
+		return nil, r.updateErr
 	}
-	return nil
+	return &UpdateDocumentsResult{}, nil
 }
 
 func (r *recordingClient) GetDocumentsByTag(ctx context.Context, tag string, pageSize int) ([]Document, error) {

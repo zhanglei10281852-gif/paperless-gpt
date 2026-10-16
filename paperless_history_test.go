@@ -49,7 +49,8 @@ func TestUpdateDocuments_HistoryStoresHumanReadableNames(t *testing.T) {
 		SuggestedDocumentType:  "Invoice",
 	}
 
-	require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false))
+	_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
+	require.NoError(t, err)
 
 	var mods []ModificationHistory
 	require.NoError(t, env.db.Find(&mods).Error)

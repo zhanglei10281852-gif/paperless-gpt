@@ -488,8 +488,8 @@ func (m *mockPaperlessClient) GetDocumentsByTag(ctx context.Context, tag string,
 func (m *mockPaperlessClient) GetDocumentCountByTag(ctx context.Context, tag string) (int, error) {
 	return 0, nil
 }
-func (m *mockPaperlessClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
-	return nil
+func (m *mockPaperlessClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) (*UpdateDocumentsResult, error) {
+	return &UpdateDocumentsResult{}, nil
 }
 func (m *mockPaperlessClient) GetDocument(ctx context.Context, documentID int) (Document, error) {
 	return Document{}, nil

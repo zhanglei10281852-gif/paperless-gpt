@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"gorm.io/gorm"
 	"net/http"
 	"net/http/httptest"
@@ -431,12 +432,14 @@ type partialUpdateClient struct {
 	calls [][]DocumentSuggestion
 }
 
-func (c *partialUpdateClient) UpdateDocuments(_ context.Context, docs []DocumentSuggestion, _ *gorm.DB, _ bool) error {
+func (c *partialUpdateClient) UpdateDocuments(_ context.Context, docs []DocumentSuggestion, _ *gorm.DB, _ bool) (*UpdateDocumentsResult, error) {
 	c.calls = append(c.calls, docs)
 	if len(c.calls) == 1 {
-		return &PartialUpdateError{DocumentID: docs[0].ID, DroppedFields: []string{"correspondent"}}
+		return &UpdateDocumentsResult{Documents: []DocumentCommitOutcome{
+			{DocumentID: docs[0].ID, CommitID: "partial-1", HistoryStatus: commitHistoryComplete},
+		}}, &PartialUpdateError{DocumentID: docs[0].ID, DroppedFields: []string{"correspondent"}}
 	}
-	return nil
+	return &UpdateDocumentsResult{}, nil
 }
 
 func (c *partialUpdateClient) GetDocument(_ context.Context, id int) (Document, error) {
@@ -478,4 +481,93 @@ func TestUpdateDocumentsHandlerReportsPartialUpdates(t *testing.T) {
 
 	require.Len(t, client.calls, 2, "the fail tag is applied in a second update")
 	assert.Equal(t, []string{"paperless-gpt-failed"}, client.calls[1][0].SuggestedTags)
+}
+
+// commitResultClient is a stub ClientInterface whose UpdateDocuments returns
+// a scripted commit outcome (and optional error).
+type commitResultClient struct {
+	mockPaperlessClient
+	result *UpdateDocumentsResult
+	err    error
+}
+
+var errHardUpdateFailure = errors.New("remote rejected the update before commit")
+
+func (c *commitResultClient) UpdateDocuments(_ context.Context, _ []DocumentSuggestion, _ *gorm.DB, _ bool) (*UpdateDocumentsResult, error) {
+	return c.result, c.err
+}
+
+func patchUpdateDocuments(t *testing.T, client ClientInterface) *httptest.ResponseRecorder {
+	t.Helper()
+	router := setupTestRouter(t)
+	app := &App{Client: client}
+	router.PATCH("/api/update-documents", app.updateDocumentsHandler)
+
+	body := `[{"id":7,"original_document":{"id":7},"suggested_title":"Bill"}]`
+	req, err := http.NewRequest(http.MethodPatch, "/api/update-documents", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+func commitOutcome(status string, already bool) *UpdateDocumentsResult {
+	return &UpdateDocumentsResult{Documents: []DocumentCommitOutcome{{
+		DocumentID:       7,
+		CommitID:         "commit-7",
+		AlreadyCommitted: already,
+		HistoryStatus:    status,
+	}}}
+}
+
+// A confirmed remote update is 200 with per-document commit status, including
+// when the local history is still being backfilled.
+func TestUpdateDocumentsHandlerReportsCommitStatuses(t *testing.T) {
+	cases := []struct {
+		name           string
+		status         string
+		already        bool
+		wantStatusCode int
+	}{
+		{name: "complete", status: commitHistoryComplete, wantStatusCode: http.StatusOK},
+		{name: "history pending", status: commitHistoryPending, wantStatusCode: http.StatusOK},
+		{name: "already committed", status: commitHistoryComplete, already: true, wantStatusCode: http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := patchUpdateDocuments(t, &commitResultClient{result: commitOutcome(tc.status, tc.already)})
+			assert.Equal(t, tc.wantStatusCode, w.Code)
+			var resp struct {
+				Commits []struct {
+					DocumentID       int    `json:"document_id"`
+					CommitID         string `json:"commit_id"`
+					AlreadyCommitted bool   `json:"already_committed"`
+					HistoryStatus    string `json:"history_status"`
+				} `json:"commits"`
+			}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			require.Len(t, resp.Commits, 1)
+			assert.Equal(t, 7, resp.Commits[0].DocumentID)
+			assert.Equal(t, "commit-7", resp.Commits[0].CommitID)
+			assert.Equal(t, tc.already, resp.Commits[0].AlreadyCommitted)
+			assert.Equal(t, tc.status, resp.Commits[0].HistoryStatus)
+		})
+	}
+}
+
+// Failures before the PATCH is confirmed keep the old 500 behavior: the UI
+// must still be able to distinguish "nothing was committed" from "committed,
+// history pending".
+func TestUpdateDocumentsHandlerHardFailureStays500(t *testing.T) {
+	client := &commitResultClient{err: errHardUpdateFailure}
+	w := patchUpdateDocuments(t, client)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	var resp struct {
+		Error   string `json:"error"`
+		Commits []any  `json:"commits"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Contains(t, resp.Error, "Error updating documents")
+	assert.Empty(t, resp.Commits)
 }

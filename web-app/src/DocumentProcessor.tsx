@@ -57,6 +57,30 @@ export interface DocumentSuggestion {
   suggested_document_type?: string;
   suggested_created_date?: string;
   suggested_custom_fields?: CustomFieldSuggestion[];
+  /**
+   * Identity of one submission. Retried submits of the same unconfirmed
+   * change reuse the id so the server never writes paperless-ngx twice; a
+   * fresh user action or a definitive server rejection uses a new one.
+   */
+  commit_id?: string;
+}
+
+/** Per-document outcome of PATCH /api/update-documents. */
+export interface DocumentCommitOutcome {
+  document_id: number;
+  commit_id: string;
+  already_committed: boolean;
+  history_status: "complete" | "pending";
+}
+
+export interface UpdateDocumentsResponse {
+  commits?: DocumentCommitOutcome[];
+  partial?: {
+    document_id: number;
+    dropped_fields: string[];
+    fail_tag?: string;
+    history_status?: "complete" | "pending";
+  };
 }
 
 export interface TagOption {

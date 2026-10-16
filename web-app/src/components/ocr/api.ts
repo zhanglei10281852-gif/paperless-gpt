@@ -1,5 +1,8 @@
 import axios from "axios";
-import { Document } from "../../DocumentProcessor";
+import {
+  Document,
+  UpdateDocumentsResponse,
+} from "../../DocumentProcessor";
 
 export interface OCRRunOptions {
   limit_pages: number;
@@ -150,15 +153,21 @@ export async function reOCRPage(
 
 export async function applyContent(
   document: Document,
-  content: string
-): Promise<void> {
-  await axios.patch("./api/update-documents", [
-    {
-      id: document.id,
-      original_document: document,
-      suggested_content: content,
-    },
-  ]);
+  content: string,
+  commitId: string
+): Promise<UpdateDocumentsResponse> {
+  const { data } = await axios.patch<UpdateDocumentsResponse>(
+    "./api/update-documents",
+    [
+      {
+        id: document.id,
+        original_document: document,
+        suggested_content: content,
+        commit_id: commitId,
+      },
+    ]
+  );
+  return data;
 }
 
 export async function saveOCRDefaults(options: OCRRunOptions): Promise<void> {

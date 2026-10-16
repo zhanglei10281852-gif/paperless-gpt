@@ -148,7 +148,7 @@ func applyFailTagAfterPartialSuccess(ctx context.Context, client ClientInterface
 		SuggestedTags:    []string{failTag},
 		KeepOriginalTags: true,
 	}
-	if err := client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, db, false); err != nil {
+	if _, err := client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, db, false); err != nil {
 		docLogger.Errorf("Document %d update succeeded after dropping fields %v, but applying fail tag %q failed: %v", documentID, droppedFields, failTag, err)
 		return
 	}
@@ -176,7 +176,7 @@ func markProcessingFailed(ctx context.Context, client ClientInterface, db *gorm.
 		recoveryFields.SuggestedTags = []string{failTag}
 		recoveryFields.KeepOriginalTags = true
 	}
-	if err := client.UpdateDocuments(ctx, []DocumentSuggestion{recoveryFields}, db, false); err != nil {
+	if _, err := client.UpdateDocuments(ctx, []DocumentSuggestion{recoveryFields}, db, false); err != nil {
 		return err
 	}
 	if failTag != "" {
@@ -336,7 +336,7 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 		// the update below does.
 		app.suggestionFailures.reset(document.ID)
 
-		err = app.Client.UpdateDocuments(ctx, suggestions, app.Database, false)
+		_, err = app.Client.UpdateDocuments(ctx, suggestions, app.Database, false)
 		if err != nil {
 			var partial *PartialUpdateError
 			if errors.As(err, &partial) {
@@ -469,7 +469,7 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		suggestion.KeepOriginalTags = true
 	}
 
-	if err := app.Client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, app.Database, false); err != nil {
+	if _, err := app.Client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, app.Database, false); err != nil {
 		var partial *PartialUpdateError
 		if errors.As(err, &partial) {
 			applyFailTagAfterPartialSuccess(ctx, app.Client, app.Database, partial.DocumentID, partial.DroppedFields)
@@ -525,7 +525,7 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 
 				// Remove only the autoOcrTag to take it out of the processing queue
 				// while preserving the OCR complete tag
-				err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{
+				_, err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{
 					{
 						ID:               document.ID,
 						OriginalDocument: document,
@@ -662,7 +662,7 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 		if options.ReplaceOriginal && processedDoc != nil && processedDoc.ReplacedOriginal {
 			docLogger.Info("Skipping tag update for replaced document (original was deleted)")
 		} else {
-			err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{
+			_, err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{
 				documentSuggestion,
 			}, app.Database, false)
 			if err != nil {

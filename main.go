@@ -274,6 +274,12 @@ func main() {
 		log.Warnf("Failed to mark interrupted OCR runs: %v", err)
 	}
 
+	// Backfill modification history for document updates that paperless-ngx
+	// already accepted but whose local history writes did not finish (crash,
+	// transient DB outage). Runs once now, then periodically; it never
+	// contacts paperless-ngx and must not block startup when the DB is slow.
+	StartCommitReconciler(ctx, database, 30*time.Second)
+
 	// Load Templates
 	if err := loadTemplates(); err != nil {
 		log.Fatalf("Failed to load templates: %v", err)

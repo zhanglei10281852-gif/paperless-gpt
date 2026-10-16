@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/disintegration/imaging"
 	"github.com/gabriel-vasile/mimetype"
+	"github.com/google/uuid"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -612,22 +614,33 @@ func marshalTagsForHistory(tags []string) string {
 	return string(b)
 }
 
-// UpdateDocuments updates the specified documents with suggested changes
-func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
+// UpdateDocuments updates the specified documents with suggested changes.
+//
+// Commit semantics: a 200 response from paperless-ngx is the only commit
+// point. Once the PATCH is accepted the update is reported as successful no
+// matter what the local modification-history database does afterwards.
+// Durable per-submission identity (DocumentUpdateCommit) plus idempotent
+// history backfilling make partial local writes recoverable, and a retried
+// client request carrying the same commit_id never reaches paperless-ngx a
+// second time. Failures before the PATCH is confirmed (rejected request,
+// unconfirmed network error) keep the pre-existing error/partial behavior.
+func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) (*UpdateDocumentsResult, error) {
+	result := &UpdateDocumentsResult{}
+
 	availableTags, err := client.GetAllTags(ctx)
 	if err != nil {
-		return fmt.Errorf("error fetching available tags: %w", err)
+		return nil, fmt.Errorf("error fetching available tags: %w", err)
 	}
 
 	availableCorrespondents, err := client.GetAllCorrespondents(ctx)
 	if err != nil {
-		return fmt.Errorf("error fetching available correspondents: %w", err)
+		return nil, fmt.Errorf("error fetching available correspondents: %w", err)
 	}
 
 	// Build document type name -> ID map
 	documentTypes, err := client.GetAllDocumentTypes(ctx)
 	if err != nil {
-		return fmt.Errorf("error fetching available document types: %w", err)
+		return nil, fmt.Errorf("error fetching available document types: %w", err)
 	}
 	availableDocumentTypes := make(map[string]int)
 	for _, dt := range documentTypes {
@@ -654,7 +667,7 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		if len(d.SuggestedCustomFields) > 0 {
 			allFields, err := client.GetCustomFields(ctx)
 			if err != nil {
-				return fmt.Errorf("error fetching custom fields for normalization: %w", err)
+				return nil, fmt.Errorf("error fetching custom fields for normalization: %w", err)
 			}
 			customFieldTypes = make(map[int]string, len(allFields))
 			for _, f := range allFields {
@@ -677,6 +690,43 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 	for _, document := range documents {
 		documentID := document.ID
 		originalDoc := document.OriginalDocument
+
+		// Identity of this submission: supplied by the client so retries of
+		// one logical submit dedupe, or generated here for background/undo
+		// callers.
+		commitID := strings.TrimSpace(document.CommitID)
+		if commitID == "" {
+			commitID = uuid.NewString()
+		}
+
+		// Idempotent fast path: a previous request with this id was already
+		// accepted by paperless-ngx. Never PATCH again — just make sure the
+		// local history caught up and report the commit as success. A local
+		// lookup problem must not block this; fall through to a normal update
+		// only when the commit is genuinely absent.
+		if existingCommit, lookupErr := getCommitByID(db, commitID); lookupErr == nil && existingCommit.Status == commitStatusApplied {
+			historyStatus := reconcileCommit(db, existingCommit)
+			result.Documents = append(result.Documents, DocumentCommitOutcome{
+				DocumentID:       documentID,
+				CommitID:         commitID,
+				AlreadyCommitted: true,
+				HistoryStatus:    historyStatus,
+			})
+			var previouslyDropped []string
+			if existingCommit.DroppedFieldsJSON != "" {
+				if jsonErr := json.Unmarshal([]byte(existingCommit.DroppedFieldsJSON), &previouslyDropped); jsonErr != nil {
+					log.Warnf("Document %d: commit %s has unreadable dropped-fields payload: %v", documentID, commitID, jsonErr)
+				}
+			}
+			if len(previouslyDropped) > 0 && firstPartial == nil {
+				firstPartial = &PartialUpdateError{DocumentID: documentID, DroppedFields: previouslyDropped}
+			}
+			log.Infof("Document %d: commit %s was already accepted by paperless-ngx; skipping the remote update (history: %s).", documentID, commitID, historyStatus)
+			continue
+		} else if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			log.Warnf("Document %d: could not look up commit %s locally, proceeding with a normal update: %v", documentID, commitID, lookupErr)
+		}
+
 		updatedFields := make(map[string]interface{})
 		originalFields := make(map[string]interface{})
 		var partialDroppedFields []string
@@ -937,7 +987,7 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 				// that this merge does not need — fetch just the fields.
 				currentFields, err := client.getCurrentCustomFields(ctx, documentID)
 				if err != nil {
-					return fmt.Errorf("error updating document %d: could not fetch current custom fields for merge: %w", documentID, err)
+					return nil, fmt.Errorf("error updating document %d: could not fetch current custom fields for merge: %w", documentID, err)
 				}
 				existingFields = currentFields
 			}
@@ -1062,17 +1112,20 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			if len(updatedFields) == 0 {
 				// All fields stripped — nothing left to send.
-				return fmt.Errorf("error updating document %d: paperless-ngx rejected every field that was suggested (dropped on previous attempts: %v)", documentID, partialDroppedFields)
+				return nil, fmt.Errorf("error updating document %d: paperless-ngx rejected every field that was suggested (dropped on previous attempts: %v)", documentID, partialDroppedFields)
 			}
 
 			jsonData, err := json.Marshal(updatedFields)
 			if err != nil {
-				return fmt.Errorf("error marshalling JSON for document %d: %w", documentID, err)
+				return nil, fmt.Errorf("error marshalling JSON for document %d: %w", documentID, err)
 			}
 
 			resp, err := client.Do(ctx, "PATCH", patchPath, bytes.NewBuffer(jsonData))
 			if err != nil {
-				return fmt.Errorf("error updating document %d: %w", documentID, err)
+				// The outcome is unconfirmed: paperless-ngx may or may not
+				// have applied the change. Keep the pre-existing hard-failure
+				// semantics (callers recover/retry) rather than committing.
+				return nil, fmt.Errorf("error updating document %d: %w", documentID, err)
 			}
 			bodyBytes, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -1083,20 +1136,20 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 			}
 
 			if resp.StatusCode != http.StatusBadRequest {
-				return fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
+				return nil, fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
 			}
 
 			// 400 — try to identify the failing fields so we can drop them and retry.
 			scalarFails, cfIdxFails, unrecoverable := parsePaperlessValidationErrors(bodyBytes)
 			if unrecoverable || (len(scalarFails) == 0 && len(cfIdxFails) == 0) {
-				return fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
+				return nil, fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
 			}
 
 			newlyDropped := stripFailedFields(updatedFields, scalarFails, cfIdxFails)
 			if len(newlyDropped) == 0 {
 				// Paperless reported errors but they don't match anything in our
 				// current payload — defensive guard against parser/format drift.
-				return fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
+				return nil, fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
 			}
 
 			partialDroppedFields = append(partialDroppedFields, newlyDropped...)
@@ -1104,7 +1157,7 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		}
 
 		if !patchSucceeded {
-			return fmt.Errorf("error updating document %d: paperless-ngx still rejected the update after %d retries (fields dropped so far: %v)", documentID, maxRetries, partialDroppedFields)
+			return nil, fmt.Errorf("error updating document %d: paperless-ngx still rejected the update after %d retries (fields dropped so far: %v)", documentID, maxRetries, partialDroppedFields)
 		}
 
 		if len(partialDroppedFields) > 0 && firstPartial == nil {
@@ -1113,6 +1166,12 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 				DroppedFields: partialDroppedFields,
 			}
 		}
+
+		// committedChanges lists the field-level changes paperless-ngx
+		// actually accepted for this document (human-readable values, matching
+		// the old ModificationHistory rows). It becomes the commit record's
+		// reconciliation payload: exactly these history rows must exist.
+		var committedChanges []CommittedFieldChange
 
 		// Check if we need to remove auto/manual tags in a separate update
 		// This happens when tags changed but resulted in an empty array (which we can't send)
@@ -1166,16 +1225,15 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 							defer tagResp.Body.Close()
 							if tagResp.StatusCode == http.StatusOK {
 								log.Infof("Document %d: Successfully removed auto/manual tag", documentID)
-								// Record this tag change with tag names for both PreviousValue and NewValue
-								mod := ModificationHistory{
-									DocumentID:    uint(documentID),
-									ModField:      "tags",
+								// Fold this tag change into the same commit
+								// instead of writing history directly: the
+								// reconciler then owns all history rows and a
+								// partial local write stays recoverable.
+								committedChanges = append(committedChanges, CommittedFieldChange{
+									Field:         "tags",
 									PreviousValue: marshalTagsForHistory(originalDoc.Tags),
 									NewValue:      marshalTagsForHistory(remainingTagNames),
-								}
-								if err := InsertModification(db, &mod); err != nil {
-									log.Warnf("Error inserting tag modification record: %v", err)
-								}
+								})
 							} else {
 								bodyBytes, _ := io.ReadAll(tagResp.Body)
 								log.Warnf("Failed to remove auto/manual tag: %d, %s", tagResp.StatusCode, string(bodyBytes))
@@ -1223,22 +1281,31 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 				prevStr = fmt.Sprintf("%v", value)
 				newStr = fmt.Sprintf("%v", updatedFields[field])
 			}
-			mod := ModificationHistory{
-				DocumentID:    uint(documentID),
-				ModField:      field,
+			committedChanges = append(committedChanges, CommittedFieldChange{
+				Field:         field,
 				PreviousValue: prevStr,
 				NewValue:      newStr,
-			}
-			if err := InsertModification(db, &mod); err != nil {
-				return fmt.Errorf("error inserting modification record for document %d: %w", documentID, err)
-			}
+			})
 		}
+
+		// paperless-ngx has confirmed the update, so this is a commit from
+		// here on: persist the durable identity and let the local history
+		// writes follow it. A local failure keeps the commit pending for the
+		// reconciler (startup/timer/idempotent retry) instead of turning the
+		// confirmed remote update into an error for the caller.
+		commit := newCommitRecord(commitID, uint(documentID), isUndo, committedChanges, partialDroppedFields, time.Now())
+		historyStatus := persistCommittedUpdate(db, &commit, committedChanges)
+		result.Documents = append(result.Documents, DocumentCommitOutcome{
+			DocumentID:    documentID,
+			CommitID:      commitID,
+			HistoryStatus: historyStatus,
+		})
 		log.Printf("Document %d updated successfully.", documentID)
 	}
 	if firstPartial != nil {
-		return firstPartial
+		return result, firstPartial
 	}
-	return nil
+	return result, nil
 }
 
 // parsePaperlessValidationErrors interprets paperless-ngx's 400 response body

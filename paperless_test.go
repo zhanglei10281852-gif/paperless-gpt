@@ -87,7 +87,7 @@ func InitializeTestDB() (*gorm.DB, error) {
 	}
 
 	// Migrate schema
-	err = db.AutoMigrate(&ModificationHistory{})
+	err = db.AutoMigrate(&ModificationHistory{}, &DocumentUpdateCommit{})
 	if err != nil {
 		return nil, err
 	}
@@ -505,7 +505,7 @@ func TestUpdateDocuments(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	err := env.client.UpdateDocuments(ctx, documents, env.db, false)
+	_, err := env.client.UpdateDocuments(ctx, documents, env.db, false)
 	require.NoError(t, err)
 }
 
@@ -642,7 +642,7 @@ func TestUpdateDocuments_RemovingLastTag(t *testing.T) {
 			})
 
 			ctx := context.Background()
-			err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{tt.document}, env.db, false)
+			_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{tt.document}, env.db, false)
 			require.NoError(t, err)
 
 			assert.Len(t, updateCalls, tt.expectUpdateCalls,
@@ -1010,7 +1010,7 @@ func TestCreatedDatePreValidation(t *testing.T) {
 		SuggestedCreatedDate: "2023-01-79", // impossible date
 	}
 
-	err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+	_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
 
 	require.NoError(t, err, "a locally-skipped invalid created_date must not produce a PartialUpdateError")
 	require.True(t, patchCalled, "PATCH must still be sent (with the valid fields)")
@@ -1056,7 +1056,7 @@ func TestCreatedDateDotSeparatorIsNormalized(t *testing.T) {
 		SuggestedCreatedDate: "2023.01.01",
 	}
 
-	err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+	_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
 	require.NoError(t, err)
 	assert.Equal(t, "2023-01-01", receivedPatch["created_date"])
 	assert.Equal(t, "Better Title", receivedPatch["title"])
@@ -1113,7 +1113,7 @@ func TestUpdateDocuments_PreservesInvisibleTags(t *testing.T) {
 		SuggestedTags: []string{"other-tag"}, // replaces the visible tag set
 	}
 
-	err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+	_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
 	require.NoError(t, err)
 
 	rawTags, ok := receivedPatch["tags"].([]interface{})
@@ -1172,7 +1172,7 @@ func TestUpdateDocuments_PreservesTagThatBecameVisible(t *testing.T) {
 		SuggestedTags: []string{"other-tag"},
 	}
 
-	err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+	_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
 	require.NoError(t, err)
 
 	rawTags, ok := receivedPatch["tags"].([]interface{})
@@ -1303,7 +1303,8 @@ func TestUpdateDocuments_AddTagsApplied(t *testing.T) {
 				AddTags:          tt.addTags,
 				RemoveTags:       tt.removeTags,
 			}
-			require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false))
+			_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
+		require.NoError(t, err)
 
 			require.Contains(t, patched, "tags", "the tag update must be sent")
 			assert.ElementsMatch(t, tt.wantTagIDs, patched["tags"])
@@ -1362,7 +1363,8 @@ func TestUpdateDocuments_CleanupPatchPreservesInvisibleTags(t *testing.T) {
 		SuggestedTitle:   "New Title", // keeps the main PATCH non-empty so tags defer to the cleanup PATCH
 		RemoveTags:       []string{"paperless-gpt-auto"},
 	}
-	require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false))
+	_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
+			require.NoError(t, err)
 
 	var tagPatch map[string]interface{}
 	for _, p := range patches {
@@ -1423,7 +1425,8 @@ func TestUpdateDocuments_CleanupPatchRemovesWorkflowTrigger(t *testing.T) {
 		SuggestedTitle:   "New Title",
 		RemoveTags:       []string{"invoices"},
 	}
-	require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false))
+	_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
+			require.NoError(t, err)
 
 	var tagPatch map[string]interface{}
 	for _, p := range patches {
@@ -1504,7 +1507,7 @@ func TestUpdateDocuments_PreserveExistingMetadata(t *testing.T) {
 				SuggestedCorrespondent: "Suggested Corp",
 				SuggestedDocumentType:  "Receipt",
 			}
-			if err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false); err != nil {
+			if _, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false); err != nil {
 				t.Fatalf("UpdateDocuments: %v", err)
 			}
 
@@ -1582,7 +1585,8 @@ func TestUpdateDocuments_TagIDLookupIsCaseInsensitive(t *testing.T) {
 			AddTags:    []string{"Paperless-GPT-Auto-Complete"},
 			RemoveTags: []string{"paperless-gpt-auto"},
 		}
-		require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false))
+		_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
+		require.NoError(t, err)
 		mu.Lock()
 		defer mu.Unlock()
 		return patched, append([]string(nil), created...)
@@ -1738,7 +1742,7 @@ func TestUpdateDocuments_CustomFieldsMergeUsesCurrentState(t *testing.T) {
 				CustomFieldsWriteMode: tt.writeMode,
 			}
 
-			err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+			_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
 			require.NoError(t, err)
 
 			rawFields, ok := receivedPatch["custom_fields"].([]interface{})
@@ -1879,7 +1883,7 @@ func TestUpdateDocuments_SkipsInvalidCustomFieldDate(t *testing.T) {
 				CustomFieldsWriteMode: tt.writeMode,
 			}
 
-			err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+			_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
 			require.NoError(t, err, "a locally-skipped invalid date must not fail the update or produce a PartialUpdateError")
 			require.Equal(t, 1, patchCount, "the update must go through in one PATCH")
 			assert.Equal(t, "Invoice RV 163/2026", receivedPatch["title"], "valid fields must still be sent")
@@ -1966,7 +1970,7 @@ func TestUpdateDocuments_StripsCustomFieldRejectedByIndexKey(t *testing.T) {
 		CustomFieldsWriteMode: "update",
 	}
 
-	err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+	_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
 
 	var partial *PartialUpdateError
 	require.ErrorAs(t, err, &partial, "the rejected field is dropped and the document flagged, not failed")
@@ -2029,7 +2033,7 @@ func TestUpdateDocuments_CustomFieldsMergeFailsWithoutCurrentState(t *testing.T)
 		CustomFieldsWriteMode: "append",
 	}
 
-	err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+	_, err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
 	require.Error(t, err, "must not fall back to suggestion-time state when the current document cannot be fetched")
 	assert.Contains(t, err.Error(), "could not fetch current custom fields")
 	assert.False(t, patchSent, "no PATCH may be sent when the merge base is unknown")
@@ -2113,7 +2117,8 @@ func TestUpdateDocuments_CorrespondentAndDocumentTypeMatchIgnoringCase(t *testin
 		SuggestedCorrespondent: "MONTANA Energieversorgung ",
 		SuggestedDocumentType:  "rechnung",
 	}
-	require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false))
+	_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
+			require.NoError(t, err)
 
 	assert.False(t, createAttempted, "an existing correspondent must be found, not created again")
 	assert.EqualValues(t, 5, patched["correspondent"])
@@ -2156,7 +2161,7 @@ func TestUpdateDocuments_CorrespondentFailureDoesNotDropOtherFields(t *testing.T
 		SuggestedTitle:         "Stromrechnung",
 		SuggestedCorrespondent: "Hidden Corp",
 	}
-	err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
+	_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
 
 	var partial *PartialUpdateError
 	require.ErrorAs(t, err, &partial, "the document is flagged, not failed")
@@ -2204,7 +2209,7 @@ func TestUpdateDocuments_DroppedCorrespondentWithoutOtherChangesIsReported(t *te
 		OriginalDocument:       Document{ID: 1, Title: "Scan"},
 		SuggestedCorrespondent: "Hidden Corp",
 	}
-	err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
+	_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, false)
 	var partial *PartialUpdateError
 	require.ErrorAs(t, err, &partial)
 	assert.Equal(t, []string{"correspondent"}, partial.DroppedFields)
@@ -2264,7 +2269,8 @@ func TestUpdateDocuments_KeepsSystemTagsWhenSuggestionsReplaceTags(t *testing.T)
 				SuggestedTags:    []string{"Bills"},
 				RemoveTags:       []string{"paperless-gpt", "paperless-gpt-auto"},
 			}
-			require.NoError(t, env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, tt.isUndo))
+			_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{doc}, env.db, tt.isUndo)
+			require.NoError(t, err)
 			require.Contains(t, patched, "tags")
 			assert.ElementsMatch(t, tt.want, patched["tags"])
 		})
@@ -2304,7 +2310,7 @@ func TestUpdateDocuments_NoMatchCorrespondentDoesNotCreate(t *testing.T) {
 	})
 	// "Unknown" is the prompt's answer for "no correspondent": not an error,
 	// so the rest is applied and the document is not flagged for review.
-	err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{{ID: 1, OriginalDocument: Document{ID: 1, Title: "Scan"}, SuggestedTitle: "Bill", SuggestedCorrespondent: " Unknown "}}, env.db, false)
+	_, err := env.client.UpdateDocuments(context.Background(), []DocumentSuggestion{{ID: 1, OriginalDocument: Document{ID: 1, Title: "Scan"}, SuggestedTitle: "Bill", SuggestedCorrespondent: " Unknown "}}, env.db, false)
 	require.NoError(t, err)
 	assert.Equal(t, "Bill", patched["title"])
 	assert.NotContains(t, patched, "correspondent")

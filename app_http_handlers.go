@@ -298,6 +298,25 @@ func suggestionJobResponse(job SuggestionJob) gin.H {
 	return response
 }
 
+// commitsResponseBody maps one commit outcome per document into the API
+// response. A nil result (defensive — should not occur on a confirmed call)
+// serializes as an empty list rather than null.
+func commitsResponseBody(result *UpdateDocumentsResult) []gin.H {
+	commits := make([]gin.H, 0)
+	if result == nil {
+		return commits
+	}
+	for _, doc := range result.Documents {
+		commits = append(commits, gin.H{
+			"document_id":       doc.DocumentID,
+			"commit_id":         doc.CommitID,
+			"already_committed": doc.AlreadyCommitted,
+			"history_status":    doc.HistoryStatus,
+		})
+	}
+	return commits
+}
+
 // updateDocumentsHandler handles the PATCH /api/update-documents endpoint
 func (app *App) updateDocumentsHandler(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -308,7 +327,7 @@ func (app *App) updateDocumentsHandler(c *gin.Context) {
 		return
 	}
 
-	err := app.Client.UpdateDocuments(ctx, documents, app.Database, false)
+	result, err := app.Client.UpdateDocuments(ctx, documents, app.Database, false)
 	var partial *PartialUpdateError
 	if errors.As(err, &partial) {
 		// The update went through without some fields. Reporting it as a
@@ -316,11 +335,19 @@ func (app *App) updateDocumentsHandler(c *gin.Context) {
 		// for review like the background processor does, and say what was
 		// left out.
 		applyFailTagAfterPartialSuccess(ctx, app.Client, app.Database, partial.DocumentID, partial.DroppedFields)
-		c.JSON(http.StatusOK, gin.H{"partial": gin.H{
-			"document_id":    partial.DocumentID,
-			"dropped_fields": partial.DroppedFields,
-			"fail_tag":       failTag,
-		}})
+		historyStatus := ""
+		if outcome := result.OutcomeFor(partial.DocumentID); outcome != nil {
+			historyStatus = outcome.HistoryStatus
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"commits": commitsResponseBody(result),
+			"partial": gin.H{
+				"document_id":    partial.DocumentID,
+				"dropped_fields": partial.DroppedFields,
+				"fail_tag":       failTag,
+				"history_status": historyStatus,
+			},
+		})
 		return
 	}
 	if err != nil {
@@ -329,7 +356,9 @@ func (app *App) updateDocumentsHandler(c *gin.Context) {
 		return
 	}
 
-	c.Status(http.StatusOK)
+	// Remote PATCH confirmed for every document — always 200, even when the
+	// local history is still being backfilled (history_status=pending).
+	c.JSON(http.StatusOK, gin.H{"commits": commitsResponseBody(result)})
 }
 
 // submitOCRJobRequest is the optional body of POST /api/documents/:id/ocr.
@@ -1102,7 +1131,7 @@ func (app *App) undoModificationHandler(c *gin.Context) {
 	}
 
 	// Update the document
-	err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, app.Database, true)
+	_, err = app.Client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, app.Database, true)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update document"})
 		log.Errorf("Failed to update document: %v", err)

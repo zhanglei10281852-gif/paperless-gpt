@@ -4,9 +4,11 @@ import {
   DocumentIcon,
   ExclamationTriangleIcon,
 } from "@heroicons/react/24/outline";
+import axios from "axios";
 import classNames from "classnames";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Document } from "../../DocumentProcessor";
+import { newCommitId } from "../../commitId";
 import Button from "../ui/Button";
 import Modal from "../ui/Modal";
 import {
@@ -163,17 +165,38 @@ const RunResults: React.FC<RunResultsProps> = ({
     }
   };
 
+  // Identity of the in-flight/last submission. Kept across retries while the
+  // text is unchanged so the server dedupes against a possibly-committed
+  // PATCH; regenerated when the text changed (never silently apply stale
+  // text through an idempotent retry).
+  const commitRef = useRef<{ id: string; key: string } | null>(null);
+
   const handleApply = async () => {
     setApplying(true);
     setError(null);
+    const commitKey = `${document.id}:${combinedText}`;
+    if (!commitRef.current || commitRef.current.key !== commitKey) {
+      commitRef.current = { id: newCommitId(), key: commitKey };
+    }
+    const commitId = commitRef.current.id;
     try {
-      await applyContent(document, combinedText);
+      const data = await applyContent(document, combinedText, commitId);
+      const outcome = data.commits?.[0];
       setShowApplyConfirm(false);
-      onApplied(
-        `Text applied to “${document.title}” — revert anytime in History.`
-      );
+      let message = `Text applied to “${document.title}” — revert anytime in History.`;
+      if (outcome?.already_committed) {
+        message = `The text was already applied to “${document.title}” in paperless-ngx; the local modification history has been recovered and is available in History.`;
+      } else if (outcome?.history_status === "pending") {
+        message = `Text applied to “${document.title}” in paperless-ngx. The local modification history is still being backfilled — it will appear in History shortly.`;
+      }
+      onApplied(message);
     } catch (err) {
       console.error("Applying content failed:", err);
+      if (axios.isAxiosError(err) && err.response) {
+        // The server definitively rejected the submit; the next try is a
+        // new submission rather than a retry of this one.
+        commitRef.current = null;
+      }
       setError("Applying the text failed — nothing was written.");
     } finally {
       setApplying(false);
