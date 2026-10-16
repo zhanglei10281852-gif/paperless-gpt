@@ -385,6 +385,20 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 	options.ExistingContent = document.Content
 
 	jobID := generateJobID()
+	trigger := "workflow:" + wf.ID
+
+	// One executor per document for the whole OCR lifecycle. If the
+	// Playground or the auto-OCR poll owns this document, defer without work:
+	// the workflow trigger tag stays on the document, no failure is recorded
+	// and no retry attempt is spent; the next poll cycle tries again.
+	exec, busyWith, acquired := ocrExecutions.tryAcquire(ctx, document.ID, jobID, trigger)
+	if !acquired {
+		docLogger.Infof("Document already has an active OCR execution (job %s, trigger %s); keeping workflow tag %q and deferring to a later cycle", busyWith.JobID, busyWith.Trigger, triggerTag)
+		return nil, nil
+	}
+	defer ocrExecutions.releaseJob(jobID)
+	runCtx := exec.ctx
+
 	jobStore.addJob(&Job{
 		ID:         jobID,
 		DocumentID: document.ID,
@@ -393,7 +407,6 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		UpdatedAt:  time.Now(),
 		Options:    options,
 	})
-	trigger := "workflow:" + wf.ID
 	if err := CreateOCRRun(app.Database, &OCRRun{
 		JobID:           jobID,
 		DocumentID:      document.ID,
@@ -414,13 +427,22 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 	var processedDoc *ProcessedDocument
 	var err error
 	if app.docProcessor != nil {
-		processedDoc, err = app.docProcessor.ProcessDocumentOCR(ctx, document.ID, options, jobID)
+		processedDoc, err = app.docProcessor.ProcessDocumentOCR(runCtx, document.ID, options, jobID)
 	} else {
-		processedDoc, err = app.ProcessDocumentOCR(ctx, document.ID, options, jobID)
+		processedDoc, err = app.ProcessDocumentOCR(runCtx, document.ID, options, jobID)
 	}
 
 	pagesDone, totalPages := jobStore.progress(jobID)
 	if err != nil {
+		// A user stop (run context canceled while the poll loop is alive) is
+		// not an OCR failure: keep the trigger tag and spend no retry attempt.
+		// The caller sees nil,nil ("skip this cycle"), same as a deferral.
+		if runCtx.Err() != nil && ctx.Err() == nil {
+			docLogger.Info("Workflow OCR run cancelled by user; leaving the trigger tag in place")
+			jobStore.updateJobStatus(jobID, "cancelled", "Job cancelled by user")
+			finishOCRRunLogged(app, jobID, "cancelled", "Job cancelled by user", pagesDone, totalPages, "", "")
+			return nil, nil
+		}
 		docLogger.Errorf("Workflow OCR processing failed: %v", err)
 		jobStore.updateJobStatus(jobID, "failed", err.Error())
 		finishOCRRunLogged(app, jobID, "failed", err.Error(), pagesDone, totalPages, "", "")
@@ -552,6 +574,19 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 		// the in-memory job store (live progress) and persisted as an OCR Run
 		// (Activity log), so hands-off users can audit what happened.
 		jobID := generateJobID()
+
+		// Only one executor per document across its whole lifecycle. If the
+		// Playground or a workflow is already running OCR for this document,
+		// defer: leave the trigger tag in place and skip this cycle without
+		// recording a failure or spending a retry attempt.
+		exec, busyWith, acquired := ocrExecutions.tryAcquire(ctx, document.ID, jobID, "auto")
+		if !acquired {
+			docLogger.Infof("Document already has an active OCR execution (job %s, trigger %s); keeping tag %q and deferring to a later cycle", busyWith.JobID, busyWith.Trigger, autoOcrTag)
+			continue
+		}
+		defer ocrExecutions.releaseJob(jobID)
+		runCtx := exec.ctx
+
 		jobStore.addJob(&Job{
 			ID:         jobID,
 			DocumentID: document.ID,
@@ -582,14 +617,25 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 		var err error
 		if app.docProcessor != nil {
 			// Use injected processor if available
-			processedDoc, err = app.docProcessor.ProcessDocumentOCR(ctx, document.ID, options, jobID)
+			processedDoc, err = app.docProcessor.ProcessDocumentOCR(runCtx, document.ID, options, jobID)
 		} else {
 			// Use the app's own implementation if no processor is injected
-			processedDoc, err = app.ProcessDocumentOCR(ctx, document.ID, options, jobID)
+			processedDoc, err = app.ProcessDocumentOCR(runCtx, document.ID, options, jobID)
 		}
 
 		pagesDone, totalPages := jobStore.progress(jobID)
 		if err != nil {
+			// The run's own context ended without the poll loop shutting down:
+			// the user stopped this executor. It is not an OCR failure — no
+			// failure count, no retry spent — and the trigger tag stays so the
+			// document runs again later. Only the run that owned the execution
+			// is touched; its deferred release frees the document.
+			if runCtx.Err() != nil && ctx.Err() == nil {
+				docLogger.Info("OCR run cancelled by user; leaving the trigger tag in place")
+				jobStore.updateJobStatus(jobID, "cancelled", "Job cancelled by user")
+				finishOCRRunLogged(app, jobID, "cancelled", "Job cancelled by user", pagesDone, totalPages, "", "")
+				continue
+			}
 			docLogger.Errorf("OCR processing failed: %v", err)
 			jobStore.updateJobStatus(jobID, "failed", err.Error())
 			finishOCRRunLogged(app, jobID, "failed", err.Error(), pagesDone, totalPages, "", "")

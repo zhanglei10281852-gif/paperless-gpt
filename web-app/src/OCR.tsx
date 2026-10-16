@@ -109,15 +109,31 @@ const OCR: React.FC = () => {
       setSelectedJobId("");
       setRuns([]);
       try {
-        const completed = await loadRuns(doc.id);
-        if (completed.length > 0) {
+        const { runs: allRuns } = await fetchOCRRuns(doc.id);
+        const completed = allRuns.filter((run) => run.status === "completed");
+        setRuns(completed);
+        // If an execution is already live for this document — a queued or
+        // running manual run, the auto-OCR poll, or a workflow — attach to it
+        // so the shown progress and the Stop button target the real executor
+        // instead of inviting a duplicate run.
+        const active = allRuns.find((run) => run.status === "in_progress");
+        if (active) {
+          setJob({
+            job_id: active.job_id,
+            document_id: doc.id,
+            status: "in_progress",
+            pages_done: active.pages_done,
+            total_pages: active.total_pages,
+          });
+          setSelectedJobId("");
+        } else if (completed.length > 0) {
           setSelectedJobId(completed[0].job_id);
         }
       } catch (err) {
         console.error("Failed to load runs for document:", err);
       }
     },
-    [loadRuns]
+    []
   );
 
   // A "Re-run…" jump from the Activity tab preselects document and options.
@@ -184,9 +200,22 @@ const OCR: React.FC = () => {
     if (!selectedDoc || !options) return;
     setError(null);
     try {
-      const jobId = await submitOCRJob(selectedDoc.id, options, promptOverride);
+      const result = await submitOCRJob(selectedDoc.id, options, promptOverride);
+      if (result.alreadyRunning) {
+        const source =
+          result.trigger === "auto"
+            ? "the automatic OCR queue"
+            : result.trigger?.startsWith("workflow:")
+              ? "a workflow"
+              : "another run";
+        setToast({
+          kind: "info",
+          message: `An OCR run for this document is already in progress (${source}) — showing its live progress.`,
+        });
+      }
       setJob({
-        job_id: jobId,
+        job_id: result.jobId,
+        document_id: selectedDoc.id,
         status: "pending",
         pages_done: 0,
         total_pages: 0,

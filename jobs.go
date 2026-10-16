@@ -12,9 +12,8 @@ import (
 )
 
 var (
-	jobCancellersMu sync.Mutex
-	jobCancellers   = make(map[string]context.CancelFunc)
-
+	// reOcrCancellers tracks single-page re-OCR requests (Playground), which
+	// are independent of the per-document OCR run executions.
 	reOcrCancellersMu sync.Mutex
 	reOcrCancellers   = make(map[string]context.CancelFunc)
 )
@@ -173,18 +172,36 @@ func startWorkerPool(app *App, numWorkers int) {
 }
 
 func processJob(app *App, job *Job) {
-	jobStore.updateJobStatus(job.ID, "in_progress", "")
+	// The document was reserved for this job when the request was accepted
+	// (manual handler) or before the background run started. The reservation
+	// covers the queued wait and the whole lifecycle — download, recognition,
+	// page-result saves, and PDF upload / version / replace — so only release
+	// it once everything is done. releaseJob is fenced by job ID: even a late
+	// call can never release a newer run of the same document.
+	defer ocrExecutions.releaseJob(job.ID)
 
-	jobCtx, cancel := context.WithCancel(context.Background())
-	jobCancellersMu.Lock()
-	jobCancellers[job.ID] = cancel
-	jobCancellersMu.Unlock()
-	defer func() {
-		cancel()
-		jobCancellersMu.Lock()
-		delete(jobCancellers, job.ID)
-		jobCancellersMu.Unlock()
-	}()
+	// The execution's context was registered when the reservation was made;
+	// stopping the job cancels it. Manual jobs get a background parent, while
+	// background runs are children of the poll-loop context.
+	jobCtx, ok := ocrExecutions.contextForJob(job.ID)
+	if !ok {
+		// Defensive: a job without a reservation (e.g. enqueued by tests)
+		// behaves like jobs used to — own a standalone cancelable context.
+		var cancel context.CancelFunc
+		jobCtx, cancel = context.WithCancel(context.Background())
+		defer cancel()
+	}
+
+	// A stop request that arrived while the job was waiting for a worker must
+	// end the run before the download starts: no OCR work and no remote side
+	// effects happen for a canceled queue slot.
+	if jobCtx.Err() != nil {
+		jobStore.updateJobStatus(job.ID, "cancelled", "Job cancelled by user")
+		finishOCRRunLogged(app, job.ID, "cancelled", "Job cancelled by user", 0, 0, "", "")
+		return
+	}
+
+	jobStore.updateJobStatus(job.ID, "in_progress", "")
 
 	// Create OCR options from job options or the effective defaults
 	// (settings-persisted values override env-derived ones).

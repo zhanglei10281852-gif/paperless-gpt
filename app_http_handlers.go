@@ -430,6 +430,26 @@ func (app *App) submitOCRJobHandler(c *gin.Context) {
 
 	// Create a new job
 	jobID := generateJobID()
+
+	// Reserve the document for the complete run lifecycle before anything is
+	// created or enqueued: download, recognition, page-result saves, and the
+	// PDF upload / version append / original replacement all belong to this
+	// one executor. A duplicate manual click, the auto-OCR poll, or a workflow
+	// poll in the same window finds the document occupied and gets a
+	// recognizable busy response pointing at the existing run. The pending
+	// queue wait is covered too, so a queued job already blocks duplicates.
+	_, busyWith, acquired := ocrExecutions.tryAcquire(context.Background(), documentID, jobID, "manual")
+	if !acquired {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":       "An OCR run is already in progress for this document.",
+			"code":        ocrBusyCode,
+			"job_id":      busyWith.JobID,
+			"trigger":     busyWith.Trigger,
+			"document_id": documentID,
+		})
+		return
+	}
+
 	job := &Job{
 		ID:         jobID,
 		DocumentID: documentID,
@@ -684,6 +704,7 @@ func (app *App) getJobStatusHandler(c *gin.Context) {
 
 	response := gin.H{
 		"job_id":      job.ID,
+		"document_id": job.DocumentID,
 		"status":      job.Status,
 		"created_at":  job.CreatedAt,
 		"updated_at":  job.UpdatedAt,
@@ -706,11 +727,12 @@ func (app *App) getAllJobsHandler(c *gin.Context) {
 	jobList := make([]gin.H, 0, len(jobs))
 	for _, job := range jobs {
 		response := gin.H{
-			"job_id":     job.ID,
-			"status":     job.Status,
-			"created_at": job.CreatedAt,
-			"updated_at": job.UpdatedAt,
-			"pages_done": job.PagesDone,
+			"job_id":      job.ID,
+			"document_id": job.DocumentID,
+			"status":      job.Status,
+			"created_at":  job.CreatedAt,
+			"updated_at":  job.UpdatedAt,
+			"pages_done":  job.PagesDone,
 		}
 
 		if job.Status == "completed" {
@@ -728,14 +750,13 @@ func (app *App) getAllJobsHandler(c *gin.Context) {
 // POST /api/ocr/jobs/:job_id/stop
 func (app *App) stopOCRJobHandler(c *gin.Context) {
 	jobID := c.Param("job_id")
-	jobCancellersMu.Lock()
-	cancel, exists := jobCancellers[jobID]
-	jobCancellersMu.Unlock()
-	if !exists {
+	// The registry owns the cancel func for every trigger — manual, auto and
+	// workflow runs alike — so stop always reaches the actual executor rather
+	// than only queued manual jobs.
+	if !ocrExecutions.cancelJob(jobID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "No running job with this ID"})
 		return
 	}
-	cancel()
 	c.Status(http.StatusNoContent)
 }
 

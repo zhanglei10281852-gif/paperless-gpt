@@ -53,11 +53,23 @@ export interface OCRRun {
 
 export interface OCRJobStatus {
   job_id: string;
+  document_id: number;
   status: "pending" | "in_progress" | "completed" | "failed" | "cancelled";
   pages_done: number;
   total_pages: number;
   result?: string;
   error?: string;
+}
+
+export interface SubmitOCRResult {
+  jobId: string;
+  /**
+   * True when the document already had an executor (manual, auto-OCR or a
+   * workflow). The returned jobId identifies that existing run; the UI should
+   * attach to its progress instead of treating the response as a failure.
+   */
+  alreadyRunning: boolean;
+  trigger?: string;
 }
 
 export interface OCRPage {
@@ -84,19 +96,37 @@ export async function submitOCRJob(
   documentId: number,
   options: OCRRunOptions,
   promptOverride: string | null
-): Promise<string> {
-  const { data } = await axios.post<{ job_id: string }>(
-    `./api/documents/${documentId}/ocr`,
-    {
-      limit_pages: options.limit_pages,
-      process_mode: options.process_mode,
-      upload_pdf: options.upload_pdf,
-      replace_original: options.replace_original,
-      copy_metadata: options.copy_metadata,
-      ...(promptOverride ? { prompt_override: promptOverride } : {}),
+): Promise<SubmitOCRResult> {
+  try {
+    const { data } = await axios.post<{ job_id: string }>(
+      `./api/documents/${documentId}/ocr`,
+      {
+        limit_pages: options.limit_pages,
+        process_mode: options.process_mode,
+        upload_pdf: options.upload_pdf,
+        replace_original: options.replace_original,
+        copy_metadata: options.copy_metadata,
+        ...(promptOverride ? { prompt_override: promptOverride } : {}),
+      }
+    );
+    return { jobId: data.job_id, alreadyRunning: false };
+  } catch (err) {
+    // 409 ocr_run_in_progress: another entry point (a previous click, the
+    // auto-OCR poll, or a workflow) is the valid executor for this document.
+    // Attach to its job rather than starting a second, duplicate run.
+    if (
+      axios.isAxiosError(err) &&
+      err.response?.status === 409 &&
+      err.response.data?.code === "ocr_run_in_progress"
+    ) {
+      return {
+        jobId: err.response.data.job_id,
+        alreadyRunning: true,
+        trigger: err.response.data.trigger,
+      };
     }
-  );
-  return data.job_id;
+    throw err;
+  }
 }
 
 export async function fetchOCRJob(jobId: string): Promise<OCRJobStatus> {

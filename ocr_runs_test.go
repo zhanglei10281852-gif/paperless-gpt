@@ -195,9 +195,11 @@ func TestSubmitOCRJobHandlerValidation(t *testing.T) {
 	assert.Equal(t, "image", run.ProcessMode)
 
 	// Drain the job the valid submission enqueued so no worker picks it up
-	// in other tests.
+	// in other tests, and release its document reservation (workers would
+	// normally release it when the job finishes).
 	select {
 	case <-jobQueue:
+		ocrExecutions.releaseJob(resp["job_id"])
 	default:
 	}
 }
